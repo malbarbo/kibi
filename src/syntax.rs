@@ -1,4 +1,3 @@
-use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 
 use crate::config::{self, parse_value as pv, parse_values as pvs};
@@ -22,9 +21,9 @@ pub enum HLType {
     Keyword2 = 35,   // Magenta
 }
 
-impl Display for HLType {
+impl HLType {
     /// Write the ANSI color escape sequence for the `HLType` using the given formatter.
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result { write!(f, "\x1b[{}m", (*self as u32) % 100) }
+    pub fn to_string(&self) -> String { crate::write_str!("\x1b[", (*self as usize) % 100, "m") }
 }
 
 /// Configuration for syntax highlighting.
@@ -79,12 +78,12 @@ impl Conf {
                 "multiline_comment_delims" =>
                     sc.ml_comment_delims = match &val.split(',').collect::<Vec<_>>()[..] {
                         [v1, v2] => Some((pv(v1)?, pv(v2)?)),
-                        d => return Err(format!("Expected 2 delimiters, got {}", d.len())),
+                        d => return Err(crate::write_str!("Expected 2 delimiters, got ", d.len())),
                     },
                 "multiline_string_delim" => sc.ml_string_delim = Some(pv(val)?),
                 "keywords_1" => sc.keywords.push((HLType::Keyword1, pvs(val)?)),
                 "keywords_2" => sc.keywords.push((HLType::Keyword2, pvs(val)?)),
-                _ => return Err(format!("Invalid key: {}", key)),
+                _ => return Err(crate::write_str!("Invalid key: ", key)),
             }
             Ok(())
         })?;

@@ -2,11 +2,10 @@
 
 use std::io::{self, BufRead, BufReader, ErrorKind::NotFound, Read, Seek, Write};
 use std::iter::{self, repeat, successors};
-use std::sync::mpsc::{Receiver, TryRecvError};
-use std::{fmt::Display, fs::File, path::Path, thread, time::Instant};
+use std::{fs::File, path::Path, thread, time::Instant};
 
 use crate::row::{HLState, Row};
-use crate::{ansi_escape::*, syntax::Conf as SyntaxConf, sys, terminal, Config, Error};
+use crate::{ansi_escape::*, syntax::Conf as SyntaxConf, sys, terminal, Config, Error, write_str, Pad, Aligment, Append};
 
 const fn ctrl_key(key: u8) -> u8 { key & 0x1f }
 const EXIT: u8 = ctrl_key(b'Q');
@@ -24,7 +23,7 @@ const HELP_MESSAGE: &str =
 /// set_status! sets a formatted status message for the editor.
 /// Example usage: `set_status!(editor, "{} written to {}", file_size, file_name)`
 macro_rules! set_status {
-    ($editor:expr, $($arg:expr),*) => ($editor.status_msg = Some(StatusMessage::new(format!($($arg),*))))
+    ($editor:expr, $($arg:expr),*) => ($editor.status_msg = Some(StatusMessage::new(write_str!($($arg),*))))
 }
 
 /// Enum of input keys
@@ -104,7 +103,10 @@ pub struct Editor {
     n_bytes: u64,
     /// A channel receiver for the "window size changed" message. A message is received shortly
     /// after a SIGWINCH signal is received.
-    ws_changed_receiver: Option<Receiver<()>>,
+    #[cfg(feature = "signal-hook")]
+    ws_changed_receiver: Option<std::sync::mpsc::Receiver<()>>,
+    #[cfg(not(feature = "signal-hook"))]
+    ws_changed_receiver: (),
     /// The original terminal mode. It will be restored when the `Editor` instance is dropped.
     orig_term_mode: Option<sys::TermMode>,
 }
@@ -128,8 +130,18 @@ fn format_size(n: u64) -> String {
     let quo_rem = successors(Some((n, 0)), |(q, _)| Some((q / 1024, q % 1024)).filter(|u| u.0 > 0));
     // unwrap(): quo_rem is never empty (since `successors` has an initial value), so _.last()
     // cannot be None
-    let ((q, r), prefix) = quo_rem.zip(&["", "k", "M", "G", "T", "P", "E", "Z"]).last().unwrap();
-    format!("{:.2$}{}B", q as f32 + r as f32 / 1024., prefix, p = if *prefix == "" { 0 } else { 2 })
+    let ((mut q, r), prefix) = quo_rem.zip(&["", "k", "M", "G", "T", "P", "E", "Z"]).last().unwrap();
+    let mut frac = (1000 * r / 1024) as usize;
+    if frac % 10 >= 5 {
+        frac = 0;
+        q += 1;
+    }
+    frac = frac / 10;
+    if frac == 0 && prefix.is_empty() {
+        write_str!(q as usize, *prefix, "B")
+    } else {
+        write_str!(q as usize, if frac == 0 { ".0" } else  { "." }, frac, *prefix, "B")
+    }
 }
 
 /// `slice_find` returns the index of `needle` in slice `s` if `needle` is a subslice of `s`,
@@ -155,7 +167,7 @@ impl Editor {
         editor.orig_term_mode = Some(sys::enable_raw_mode()?);
         editor.update_window_size()?;
 
-        set_status!(editor, "{}", HELP_MESSAGE);
+        set_status!(editor, HELP_MESSAGE);
 
         Ok(editor)
     }
@@ -202,24 +214,33 @@ impl Editor {
         self.cursor.x = self.cursor.x.min(self.current_row().map_or(0, |row| row.chars.len()))
     }
 
+    #[cfg(feature = "signal-hook")]
+    fn handle_windows_size(&mut self) -> Result<(), Error> {
+        use std::sync::mpsc::{Receiver, TryRecvError};
+        // Handle window size if a signal has be received
+        match self.ws_changed_receiver.as_ref().map(Receiver::try_recv) {
+            // If there is no receiver or no "window size updated" signal has been received, do
+            // nothing.
+            None | Some(Err(TryRecvError::Empty)) => Ok(()),
+            // A "window size updated" signal has been received
+            Some(Ok(())) => {
+                self.update_window_size()?;
+                self.refresh_screen()
+            }
+            Some(Err(err)) => return Err(Error::MPSCTryRecv(err)),
+        }
+    }
+
+    #[cfg(not(feature = "signal-hook"))]
+    fn handle_windows_size(&mut self) -> Result<(), Error> { Ok(()) }
+
     /// Run a loop to obtain the key that was pressed. At each iteration of the loop (until a key is
     /// pressed), we listen to the `ws_changed` channel to check if a window size change signal has
     /// been received. When bytes are received, we match to a corresponding `Key`. In particular,
     /// we handle ANSI escape codes to return `Key::Delete`, `Key::Home` etc.
     fn loop_until_keypress(&mut self) -> Result<Key, Error> {
         loop {
-            // Handle window size if a signal has be received
-            match self.ws_changed_receiver.as_ref().map(Receiver::try_recv) {
-                // If there is no receiver or no "window size updated" signal has been received, do
-                // nothing.
-                None | Some(Err(TryRecvError::Empty)) => (),
-                // A "window size updated" signal has been received
-                Some(Ok(())) => {
-                    self.update_window_size()?;
-                    self.refresh_screen()?;
-                }
-                Some(Err(err)) => return Err(Error::MPSCTryRecv(err)),
-            }
+            self.handle_windows_size()?;
             let mut bytes = io::stdin().bytes();
             // Match on the next byte received or, if the first byte is <ESC> ('\x1b'), on the next
             // few bytes.
@@ -454,11 +475,11 @@ impl Editor {
         match self.save(file_name) {
             Ok(written) => {
                 self.dirty = false;
-                set_status!(self, "{} written to {}", format_size(written as u64), file_name);
+                set_status!(self, format_size(written as u64), " written to ", file_name);
                 true
             }
             Err(err) => {
-                set_status!(self, "Can't save! I/O error: {}", err);
+                set_status!(self, "Can't save! I/O error: ", err);
                 false
             }
         }
@@ -495,10 +516,14 @@ impl Editor {
     }
 
     /// Draw the left part of the screen: line numbers and vertical bar.
-    fn draw_left_padding<T: Display>(&self, buffer: &mut String, val: T) {
+    fn draw_left_padding<T>(&self, buffer: &mut String, val: T)
+        where String: Append<T> + for<'a> Append<&'a str>,
+    {
         if self.ln_pad >= 2 {
             // \x1b[38;5;240m: Dark grey color; \u{2502}: pipe "│"
-            buffer.push_str(&format!("\x1b[38;5;240m{:>1$} \u{2502}", val, self.ln_pad - 2));
+            buffer.append("\x1b[38;5;240m");
+            buffer.append(Pad(Aligment::Right, self.ln_pad - 2, val));
+            buffer.append(" \u{2502}");
             buffer.push_str(RESET_FMT)
         }
     }
@@ -520,8 +545,8 @@ impl Editor {
                 // Draw an empty row
                 self.draw_left_padding(buffer, '~');
                 if self.is_empty() && i == self.screen_rows / 3 {
-                    let welcome_message = format!("Kibi - version {}", env!("CARGO_PKG_VERSION"));
-                    buffer.push_str(&format!("{:^1$.1$}", welcome_message, self.screen_cols));
+                    let welcome_message = concat!("Kibi - version ", env!("CARGO_PKG_VERSION"));
+                    buffer.append(Pad(Aligment::Center, self.screen_cols, welcome_message));
                 }
             }
             buffer.push_str("\r\n");
@@ -533,17 +558,20 @@ impl Editor {
         // Left part of the status bar
         let modified = if self.dirty { " (modified)" } else { "" };
         let mut left =
-            format!("{:.30}{}", self.file_name.as_deref().unwrap_or("[No Name]"), modified);
+            write_str!(self.file_name.as_deref().unwrap_or("[No Name]"), modified);
         left.truncate(self.window_width);
 
         // Right part of the status bar
         let size = format_size(self.n_bytes + self.rows.len().saturating_sub(1) as u64);
         let right =
-            format!("{} | {} | {}:{}", self.syntax.name, size, self.cursor.y + 1, self.rx() + 1);
+            write_str!(&self.syntax.name, " | ", size,  " | ", self.cursor.y + 1, ":", self.rx() + 1);
 
         // Draw
-        let rw = self.window_width.saturating_sub(left.len());
-        buffer.push_str(&format!("{}{}{:>4$.4$}{}\r\n", REVERSE_VIDEO, left, right, RESET_FMT, rw));
+        buffer.append(REVERSE_VIDEO);
+        buffer.append(&left);
+        buffer.append(" ".repeat(self.window_width - left.len() - right.len()));
+        buffer.append(&right);
+        buffer.append(RESET_FMT);
     }
 
     /// Draw the message bar on the terminal, by adding characters to the buffer.
@@ -559,7 +587,7 @@ impl Editor {
     /// move the cursor to the correct position.
     fn refresh_screen(&mut self) -> Result<(), Error> {
         self.scroll();
-        let mut buffer = format!("{}{}", HIDE_CURSOR, MOVE_CURSOR_TO_START);
+        let mut buffer = write_str!(HIDE_CURSOR, MOVE_CURSOR_TO_START);
         self.draw_rows(&mut buffer);
         self.draw_status_bar(&mut buffer);
         self.draw_message_bar(&mut buffer);
@@ -571,8 +599,15 @@ impl Editor {
             (self.status_msg.as_ref().map_or(0, |sm| sm.msg.len() + 1), self.screen_rows + 2)
         };
         // Finally, print `buffer` and move the cursor
-        print!("{}\x1b[{};{}H{}", buffer, cursor_y, cursor_x, SHOW_CURSOR);
-        io::stdout().flush().map_err(Error::from)
+        let mut stdout = io::stdout();
+        stdout.write_all(buffer.as_bytes())?;
+        stdout.write_all(b"\x1b[")?;
+        stdout.write_all(cursor_y.to_string().as_bytes())?;
+        stdout.write_all(b";")?;
+        stdout.write_all(cursor_x.to_string().as_bytes())?;
+        stdout.write_all(b"H")?;
+        stdout.write_all(SHOW_CURSOR.as_bytes())?;
+        stdout.flush().map_err(Error::from)
     }
 
     /// Process a key that has been pressed, when not in prompt mode. Returns whether the program
@@ -608,7 +643,7 @@ impl Editor {
                     return Ok((true, None));
                 }
                 let times = if quit_times > 1 { "times" } else { "time" };
-                set_status!(self, "Press Ctrl+Q {} more {} to quit.", quit_times, times);
+                set_status!(self, "Press Ctrl+Q ", quit_times, " more ", times, " to quit.");
             }
             Key::Char(SAVE) => match self.file_name.take() {
                 // TODO: Can we avoid using take() then reassigning the value to file_name?
@@ -667,7 +702,7 @@ impl Editor {
         self.file_name = file_name;
         loop {
             if let Some(mode) = self.prompt_mode.as_ref() {
-                set_status!(self, "{}", mode.status_msg());
+                set_status!(self, mode.status_msg());
             }
             self.refresh_screen()?;
             let key = self.loop_until_keypress()?;
@@ -691,8 +726,10 @@ impl Drop for Editor {
             sys::set_term_mode(&orig_term_mode).expect("Could not restore original terminal mode.")
         }
         if !thread::panicking() {
-            print!("{}{}", CLEAR_SCREEN, MOVE_CURSOR_TO_START);
-            io::stdout().flush().expect("Could not flush stdout")
+            let mut stdout = io::stdout();
+            stdout.write_all(CLEAR_SCREEN.as_bytes()).unwrap();
+            stdout.write_all(MOVE_CURSOR_TO_START.as_bytes()).unwrap();
+            stdout.flush().expect("Could not flush stdout");
         }
     }
 }
@@ -713,9 +750,9 @@ impl PromptMode {
     /// Return the status message to print for the selected `PromptMode`.
     fn status_msg(&self) -> String {
         match self {
-            Self::Save(buffer) => format!("Save as: {}", buffer),
-            Self::Find(buffer, ..) => format!("Search (Use ESC/Arrows/Enter): {}", buffer),
-            Self::GoTo(buffer) => format!("Enter line number[:column number]: {}", buffer),
+            Self::Save(buffer) => write_str!("Save as: ", buffer),
+            Self::Find(buffer, ..) => write_str!("Search (Use ESC/Arrows/Enter): ", buffer),
+            Self::GoTo(buffer) => write_str!("Enter line number[:column number]: ", buffer),
         }
     }
 
@@ -766,7 +803,7 @@ impl PromptMode {
                                 ed.update_cursor_x_position();
                             }
                         }
-                        (Err(e), _) | (_, Err(e)) => set_status!(ed, "Parsing error: {}", e),
+                        (Err(e), _) | (_, Err(e)) => set_status!(ed, "Parsing error: ", e),
                         (Ok(None), _) => (),
                     }
                 }

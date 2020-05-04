@@ -12,12 +12,12 @@ categories = ["text-editors", "development-tools"]
 include = ["src/**/*", "Cargo.toml", "LICENSE*", "COPYRIGHT"]
 
 [dependencies]
-unicode-width = "0.1.7"
+unicode-width = { version = "0.1.7", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.69"
+libc = {version = "0.2.69", default-features = false }
 nix = "0.17.0"
-signal-hook = "0.1.13"
+signal-hook = { version = "0.1.13", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.8", default-features = false, features = ["wincon"] }
@@ -30,3 +30,9 @@ serial_test = "0.4.0"
 [badges]
 travis-ci = { repository = "ilai-deutel/kibi", branch = "master" }
 maintenance = { status = "actively-developed" }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+opt-level = 's'

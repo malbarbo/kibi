@@ -3,11 +3,9 @@
 //! UNIX-specific structs and functions. Will be imported as `sys` on UNIX systems.
 
 use std::env::var;
-use std::sync::mpsc::{self, Receiver};
 
 use libc::{STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ, VMIN, VTIME};
 use nix::{pty::Winsize, sys::termios};
-use signal_hook::{iterator::Signals, SIGWINCH};
 
 // On UNIX systems, Termios represents the terminal mode.
 pub use nix::sys::termios::Termios as TermMode;
@@ -21,7 +19,7 @@ use crate::Error;
 /// The XDG Base Directory Specification is defined here:
 /// <https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html>
 fn xdg_dirs(xdg_type: &str, def_home_suffix: &str, def_dirs: &str) -> Vec<String> {
-    let (home_key, dirs_key) = (format!("XDG_{}_HOME", xdg_type), format!("XDG_{}_DIRS", xdg_type));
+    let (home_key, dirs_key) = (crate::write_str!("XDG_", xdg_type, "_HOME"), crate::write_str!("XDG_", xdg_type, "_DIRS"));
 
     let mut dirs = Vec::new();
 
@@ -62,15 +60,20 @@ pub fn get_window_size() -> Result<(usize, usize), Error> {
 }
 
 /// Return a MPSC receiver that receives a message whenever the window size is updated.
-pub fn get_window_size_update_receiver() -> Result<Option<Receiver<()>>, Error> {
+#[cfg(feature = "signal-hook")]
+pub fn get_window_size_update_receiver() -> Result<Option<std::sync::mpsc::Receiver<()>>, Error> {
+    use signal_hook::{iterator::Signals, SIGWINCH};
     // Create a channel for receiving window size update requests
-    let (ws_changed_tx, ws_changed_rx) = mpsc::sync_channel(1);
+    let (ws_changed_tx, ws_changed_rx) = std::sync::mpsc::sync_channel(1);
     // Spawn a new thread that will push to the aforementioned channel every time the SIGWINCH
     // signal is received
     let signals = Signals::new(&[SIGWINCH])?;
     std::thread::spawn(move || signals.forever().for_each(|_| ws_changed_tx.send(()).unwrap()));
     Ok(Some(ws_changed_rx))
 }
+
+#[cfg(not(feature = "signal-hook"))]
+pub fn get_window_size_update_receiver() -> Result<(), Error> { Ok(()) }
 
 /// Set the terminal mode.
 pub fn set_term_mode(term: &TermMode) -> Result<(), nix::Error> {

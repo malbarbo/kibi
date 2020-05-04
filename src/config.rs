@@ -4,7 +4,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::{fmt::Display, fs::File, str::FromStr, time::Duration};
+use std::{fs::File, str::FromStr, time::Duration};
 
 use crate::{sys::conf_dirs as cdirs, Error, Error::Config as ConfErr};
 
@@ -58,7 +58,7 @@ impl Config {
                     "message_duration" =>
                         conf.message_dur = Duration::from_secs_f32(parse_value(value)?),
                     "show_line_numbers" => conf.show_line_num = parse_value(value)?,
-                    _ => return Err(format!("Invalid key: {}", key)),
+                    _ => return Err(crate::write_str!("Invalid key: ", key)),
                 };
                 Ok(())
             })?;
@@ -88,13 +88,23 @@ where F: FnMut(&str, &str) -> Result<(), String> {
 }
 
 /// Trim a value (right-hand side of a key=value INI line) and parses it.
-pub fn parse_value<T: FromStr<Err = E>, E: Display>(value: &str) -> Result<T, String> {
-    value.trim().parse().map_err(|e| format!("Parser error: {}", e))
+pub(crate) fn parse_value<T: FromStr>(value: &str) -> Result<T, String>
+where String: crate::Append<T::Err> + for<'a> crate::Append<&'a str>,
+{
+    match value.trim().parse() {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let e: T::Err = e;
+            Err(crate::write_str!("Parser error: ", e))
+        }
+    }
 }
 
 /// Split a comma-separated list of values (right-hand side of a key=value1,value2,... INI line) and
 /// parse it as a Vec.
-pub fn parse_values<T: FromStr<Err = E>, E: Display>(value: &str) -> Result<Vec<T>, String> {
+pub(crate) fn parse_values<T: FromStr>(value: &str) -> Result<Vec<T>, String>
+where String: crate::Append<<T as FromStr>::Err>,
+{
     value.split(',').map(parse_value).collect()
 }
 

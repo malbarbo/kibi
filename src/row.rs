@@ -7,7 +7,17 @@ use std::iter::repeat;
 
 use crate::ansi_escape::{RESET_FMT, REVERSE_VIDEO};
 use crate::syntax::{Conf as SyntaxConf, HLType};
+#[cfg(feature = "unicode-width")]
 use unicode_width::UnicodeWidthChar;
+#[cfg(not(feature = "unicode-width"))]
+trait CharWidth {
+    fn width(&self) -> Option<usize> {
+        Some(1)
+    }
+}
+#[cfg(not(feature = "unicode-width"))]
+impl CharWidth for char { }
+
 
 /// The "Highlight State" of the row
 #[derive(Clone, Copy, PartialEq)]
@@ -189,7 +199,7 @@ impl Row {
         for (c, mut hl_type) in chars.zip(self.hl.iter().skip(offset)) {
             if c.is_ascii_control() {
                 let rendered_char = if (c as u8) <= 26 { (b'@' + c as u8) as char } else { '?' };
-                buffer.push_str(&format!("{}{}{}", REVERSE_VIDEO, rendered_char, RESET_FMT,));
+                buffer.push_str(&crate::write_str!(REVERSE_VIDEO, rendered_char, RESET_FMT));
                 // Restore previous color
                 if current_hl_type != HLType::Normal {
                     buffer.push_str(&current_hl_type.to_string());
